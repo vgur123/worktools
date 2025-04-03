@@ -1,0 +1,70 @@
+import com.sbt.transfers.exception.RouterTimeoutException;
+import com.sbt.transfers.exception.RouterUnavailableException;
+import com.sbt.transfers.service.flow.sub.metric.SubFlowMetric;
+import org.slf4j.MDC;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+import reactor.util.context.ContextView;
+import ru.sbrf.p2p.webfluxflow.context.ContextWithRs;
+import ru.sbrf.p2p.webfluxflow.exceptions.RequestCanceledException;
+import ru.sbrf.p2p.webfluxflow.service.monitored.impl.MonitoredServiceImpl;
+
+import java.util.Map;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
+
+public abstract class AbstractMonitoredService<RQ, RS> extends MonitoredServiceImpl<RQ, RS> {
+
+    private final SubFlowMetric<ContextWithRs<RQ, RS>> metricService;
+    public Function<ContextWithRs<RQ, RS>, String> serviceNameFunction;
+
+    public AbstractMonitoredService(SubFlowMetric<ContextWithRs<RQ, RS>> metricService, Function<ContextWithRs<RQ, RS>, String> serviceNameFunction) {
+        this.metricService = metricService;
+        this.serviceNameFunction = serviceNameFunction;
+    }
+
+    @Override
+    public Mono<RS> apply(RQ rq) {
+        return Mono.deferContextual(context -> {
+            ContextWithRs<RQ, RS> ctxWithRs = (ContextWithRs<RQ, RS>) createCtx.apply(rq, context);
+            rqLogger.accept(ctxWithRs);
+            return service.apply(rq)
+                .doOnCancel(() -> {
+                    putRqUID(ctxWithRs.getReactContext());
+                    if (ctxWithRs.getTime() >= 0) return;
+                    ctxWithRs.setTime(System.currentTimeMillis() - ctxWithRs.getStartTime());
+                    ctxWithRs.setThrowable(RequestCanceledException.instance);
+                    rsLogger.accept(ctxWithRs);
+                    metricService.accept(ctxWithRs);
+                })
+                .doOnNext(rs -> {
+                    putRqUID(ctxWithRs.getReactContext());
+                    ctxWithRs.setRs(rs);
+                    validate.accept(rs);
+                })
+                .doOnSuccess(rs -> {
+                    putRqUID(ctxWithRs.getReactContext());
+                    ctxWithRs.setTime(System.currentTimeMillis() - ctxWithRs.getStartTime());
+                    rsLogger.accept(ctxWithRs);
+                    metricService.accept(ctxWithRs);
+                })
+                .onErrorMap(TimeoutException.class, ex -> new RouterTimeoutException(serviceNameFunction.apply(ctxWithRs)))
+                .onErrorMap(WebClientRequestException.class, ex ->  new RouterUnavailableException(serviceNameFunction.apply(ctxWithRs)))
+                .onErrorMap(WebClientResponseException.class, ex -> new RouterUnavailableException(serviceNameFunction.apply(ctxWithRs)))
+                .doOnError(throwable -> {
+                    putRqUID(ctxWithRs.getReactContext());
+                    ctxWithRs.setTime(System.currentTimeMillis() - ctxWithRs.getStartTime());
+                    ctxWithRs.setThrowable(throwable);
+                    rsLogger.accept(ctxWithRs);
+                    metricService.accept(ctxWithRs);
+                });
+        });
+    }
+
+    private void putRqUID(ContextView reactContext) {
+        Map<String, String> mdc = reactContext.get("MDC");
+        MDC.setContextMap(mdc);
+    }
+
+}
