@@ -1,0 +1,155 @@
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sbt.transfers.config.RouterConfiguration;
+import com.sbt.transfers.context.GetInfoContext;
+import com.sbt.transfers.context.InfoRequestParam;
+import com.sbt.transfers.exception.RouterException;
+import com.sbt.transfers.exception.SuitException;
+import com.sbt.transfers.exception.ValidationException;
+import com.sbt.transfers.info.model.v2.DetailedTransferInfoRq;
+import com.sbt.transfers.info.model.v2.DetailedTransferInfoRs;
+import com.sbt.transfers.info.model.v2.StatusType;
+import com.sbt.transfers.service.ConfigurationService;
+import com.sbt.transfers.service.flow.logger.FlowRqLogger;
+import com.sbt.transfers.service.flow.logger.FlowRsLogger;
+import com.sbt.transfers.service.flow.metric.GetInfoContextMetric;
+import com.sbt.transfers.service.flow.sub.CommonTransferExternalCallSubFlow;
+import com.sbt.transfers.service.flow.sub.EmptyOperationInfoSbpTransferSubFlow;
+import com.sbt.transfers.service.flow.sub.RequestValidationSubFlow;
+import com.sbt.transfers.service.flow.sub.SbpTransferExternalCallSubFlow;
+import com.sbt.transfers.util.Utils;
+import com.sbt.transfers.utils.RQUtil;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.HttpHeaders;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
+import ru.sbrf.p2p.webfluxflow.context.impl.RequestWithParam;
+import ru.sbrf.p2p.webfluxflow.exceptions.RequestCanceledException;
+import ru.sbrf.p2p.webfluxflow.service.flow.impl.FlowFunctionImpl;
+
+import java.util.Map;
+
+@RequiredArgsConstructor
+@Slf4j
+@Component
+public class GetInfoFlow extends FlowFunctionImpl<RequestWithParam<DetailedTransferInfoRq, InfoRequestParam>, DetailedTransferInfoRs, GetInfoContext> {
+
+    private final CommonTransferExternalCallSubFlow commonExternalCallSubFlow;
+    private final SbpTransferExternalCallSubFlow sbpTransferExternalCallSubFlow;
+    private final EmptyOperationInfoSbpTransferSubFlow emptyOperationInfoSbpTransferSubFlow;
+    private final RequestValidationSubFlow requestValidationSubFlow;
+
+    private final GetInfoContextMetric metricService = new GetInfoContextMetric();
+    private final ConfigurationService configurationService;
+    private final RouterConfiguration routerConfiguration;
+
+    @Override
+    public Mono<DetailedTransferInfoRs> apply(RequestWithParam<DetailedTransferInfoRq, InfoRequestParam> rq) {
+        Map<String, String> mapMdc = RQUtil.mdc(Utils.getOrDefault(() -> rq.getRequest().getRqInfo().getRqUID(), ""));
+        GetInfoContext ctx = start(rq);
+        return subFlow
+            .apply(ctx)
+            .doOnCancel(() -> {
+                if (ctx.getTime() >= 0) return;
+                ctx.setTime(System.currentTimeMillis() - ctx.getStartTime());
+                applyError.accept(ctx, RequestCanceledException.instance);
+                rsLogger.accept(ctx);
+                metricService.accept(ctx);
+            })
+            .onErrorResume(throwable -> {
+                applyError.accept(ctx, throwable);
+                return Mono.just(ctx);
+            })
+            .map((context) -> {
+                ctx.setTime(System.currentTimeMillis() - ctx.getStartTime());
+                rsLogger.accept(ctx);
+                metricService.accept(ctx);
+                return ctx.getRs();
+            })
+            .contextWrite(context -> context.put("MDC", mapMdc));
+    }
+
+    @Autowired
+    public void init(@Qualifier("loggerObjectMapper") ObjectMapper loggerObjectMapper) {
+        rqLogger = new FlowRqLogger(loggerObjectMapper);
+        rsLogger = new FlowRsLogger(loggerObjectMapper);
+
+        mdcContext = rq -> RQUtil.mdc(Utils.get(() -> rq.getRequest().getRqInfo().getRqUID()));
+        fillContextDefault = ctx -> {
+            ctx.setActionName("get_info");
+            DetailedTransferInfoRs rs = ctx.getRs();
+            rs.setStatus(new StatusType());
+            rs.getStatus().setSourceSystemId("GLOBAL_SEARCH_ROUTER");
+            rs.setRqInfo(ctx.getRq().getRequest().getRqInfo());
+            HttpHeaders headers = new HttpHeaders();
+            headers.add("x-request-id", Utils.getOrDefault(() -> ctx.getRq().getRequestParam().getXRequestId(), StringUtils.EMPTY));
+            ctx.getRq().getRequestParam().setHeaders(headers);
+        };
+
+        subFlow = subFlow
+            .next(requestValidationSubFlow)
+            .next(context -> {
+                if (context.getRq().getRequest().getDocId() != null &&
+                    context.getRq().getRequest().getDocId().length() == 14) {
+                    if (context.getRq().getRequest().getDocId().toLowerCase().startsWith("w") ||
+                        context.getRq().getRequest().getDocId().toLowerCase().startsWith("d")) {
+                        context.getRq().getRequest().setDocId(
+                            context.getRq().getRequest().getDocId().substring(1)
+                        );
+                    }
+                }
+                return Mono.just(context);
+            })
+            .next(context -> {
+                if (isEmptyOperationInfoWithNspk(context)) return emptyOperationInfoSbpTransferSubFlow.apply(context);
+                if (isSbp(context)) return sbpTransferExternalCallSubFlow.apply(context);
+                return commonExternalCallSubFlow.apply(context);
+            });
+    }
+
+    private boolean isEmptyOperationInfoWithNspk(GetInfoContext context) {
+        return routerConfiguration.getEmptyOperationInfoSystems().stream()
+            .anyMatch(system -> system.equalsIgnoreCase(context.getRq().getRequest().getRqInfo().getScName()));
+    }
+
+    private boolean isSbp(GetInfoContext context) {
+        if (context.getRq().getRequest().getSuit() != null) {
+            context.setSuit(context.getRq().getRequest().getSuit());
+            context.setExternalConfiguration(configurationService.getConfiguration(context));
+            context.getRs().getStatus().setSourceSystemId(context.getExternalConfiguration().name());
+            return StringUtils.containsIgnoreCase(context.getExternalConfiguration().getProducts().get(0).getProduct(), "SBP");
+        }
+        if (context.getRq().getRequest().getDocId() != null) {
+            return true;
+        }
+        if (context.getRq().getRequest().getNspkId() != null) {
+            return true;
+        }
+
+        throw ValidationException.create("Не заполнен SUIT/DOC_ID/NSPK_ID");
+    }
+
+    @Override
+    protected void applyError(GetInfoContext context, Throwable throwable) {
+        DetailedTransferInfoRs response = context.getRs();
+
+        if (throwable instanceof SuitException) {
+            log.error("Exception", throwable);
+            SuitException exception = (SuitException) throwable;
+            response.getStatus().setStatusCode(10);
+            response.getStatus().setStatusDesc(exception.getMessage());
+        } else if (throwable instanceof RouterException) {
+            response.getStatus().setStatusCode(((RouterException) throwable).getErrorCode());
+            response.getStatus().setStatusDesc(((RouterException) throwable).getErrorDescription());
+            response.getStatus().setSourceSystemId(((RouterException) throwable).getSourceSystem());
+        } else {
+            log.error("Exception", throwable);
+            response.getStatus().setStatusCode(12);
+            response.getStatus().setStatusDesc("Возникла внутренняя ошибка");
+        }
+    }
+
+}
