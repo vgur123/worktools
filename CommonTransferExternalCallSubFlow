@@ -1,0 +1,51 @@
+import com.sbt.transfers.config.RouterConfiguration;
+import com.sbt.transfers.context.GetInfoContext;
+import com.sbt.transfers.info.model.v2.DetailedTransferInfoRq;
+import com.sbt.transfers.info.model.v2.DetailedTransferInfoRs;
+import com.sbt.transfers.service.ConfigurationService;
+import com.sbt.transfers.service.SuitService;
+import com.sbt.transfers.service.external.monitored.ExternalCallMonitoredService;
+import com.sbt.transfers.service.flow.RequestWithConfiguration;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Mono;
+import ru.sbrf.p2p.webfluxflow.service.subflow.SubFlowFunction;
+
+@Service
+@RequiredArgsConstructor
+public class CommonTransferExternalCallSubFlow implements SubFlowFunction<GetInfoContext>  {
+
+    private final ExternalCallMonitoredService externalCallMonitoredService;
+    private final SuitService suitService;
+    private final RouterConfiguration routerConfiguration;
+    private final ConfigurationService configurationService;
+
+    @Override
+    public Mono<GetInfoContext> apply(GetInfoContext ctx) {
+        return SubFlowFunction.extCall(ctx, this::getRq, externalCallMonitoredService, this::setResponse);
+    }
+
+    public RequestWithConfiguration<DetailedTransferInfoRq, HttpHeaders> getRq(GetInfoContext ctx) {
+        DetailedTransferInfoRq request = ctx.getRq().getRequest();
+        if (routerConfiguration.getShortSuitProducts().contains(ctx.getExternalConfiguration().name().toLowerCase())) {
+            request.setSuit(suitService.extractSuit(ctx.getSuit()));
+        } else {
+            request.setSuit(ctx.getSuit());
+        }
+
+        return RequestWithConfiguration.notLegacy(
+                ctx.getRq().getRequest(),
+                ctx.getRq().getRequestParam().getHeaders(),
+                ctx.getExternalConfiguration()
+        );
+    }
+
+    public void setResponse(GetInfoContext ctx, DetailedTransferInfoRs response) {
+        if (response.getStatus() == null) {
+            throw new RuntimeException("Некорректный ответ от сервиса");
+        }
+        ctx.setRs(response);
+    }
+
+}
