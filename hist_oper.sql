@@ -3,10 +3,10 @@ do $$
         date_start date := '2024-12-03';
 	    date_stop date := '2024-12-03';
 
-        datePartBegin date:='2000-01-01'; --Эту дату не менять!!!
+        datePartBegin date:='2000-01-01'; --Do not change!!!
 
-        maxStep integer := 3000; --Максимальное количество шагов
-        rowsStep integer := 1000; --Количество строк за шаг
+        maxStep integer := 3000; 	--Max steps
+        rowsStep integer := 1000; 	--Records per step
 
         id_start  bigint;
         id_stop  bigint;
@@ -17,35 +17,34 @@ do $$
 
         part_start  bigint;
         part_stop  bigint;
-
+		
+	odate 				date;
+	extid 				VARCHAR(32);
+	n     				int8;
+        vRECIPIENT_LAST_NAME	    	VARCHAR(100);
+        vRECIPIENT_FIRST_NAME		VARCHAR(100);
+        vRECIPIENT_MIDDLE_NAME		VARCHAR(100);
     begin
 
         DROP TABLE IF EXISTS t;
         CREATE TEMPORARY TABLE t(
-            id 			bigserial    not null PRIMARY KEY,
-            OPERATION_DATE	DATE NOT NULL,
-            EXT_ID		VARCHAR(32) NOT NULL,
-            RECIPIENT_PHONE_NUMBER VARCHAR(15),
-            STATUS_VALUE	VARCHAR(20),
-            SENDER_INN	VARCHAR(12),
-            SENDER_ACCOUNT VARCHAR(20),
-            VERIFICATION_DATE	DATE,
-            CUSTOM_PRODUCT_TYPE VARCHAR(12),
-            RECIPIENT_EPK_ID VARCHAR(30),
-            SENDER_BANK_ID	VARCHAR(12),
-            SENDER_BIC VARCHAR(10)
+            id 				bigserial    not null PRIMARY KEY,
+            OPERATION_DATE		DATE NOT NULL,
+            EXT_ID			VARCHAR(32) NOT NULL,
+            RECIPIENT_LAST_NAME	    	VARCHAR(100),
+            RECIPIENT_FIRST_NAME	VARCHAR(100),
+            RECIPIENT_MIDDLE_NAME	VARCHAR(100)
         );
 
         part_start:=DATE_PART('Day', date_start::timestamp-datePartBegin::timestamp);
         part_stop:=DATE_PART('Day', date_stop::timestamp-datePartBegin::timestamp);
 
     for n in part_start..part_stop loop
-        insert into t (RECIPIENT_PHONE_NUMBER, STATUS_VALUE,     SENDER_INN,     SENDER_ACCOUNT,        VERIFICATION_DATE,  CUSTOM_PRODUCT_TYPE,     RECIPIENT_EPK_ID,     SENDER_BANK_ID,     SENDER_BIC,     EXT_ID,     OPERATION_DATE)
-        select trn.RECIPIENT_PHONE_NUMBER, trn.STATUS_VALUE, trn.SENDER_INN, trn.SENDER_ACCOUNT, trn.VERIFICATION_DATE, trn.CUSTOM_PRODUCT_TYPE, trn.RECIPIENT_EPK_ID, trn.SENDER_BANK_ID, trn.SENDER_BIC, trn.EXT_ID, trn.CREATE_DATE
+        insert into t (RECIPIENT_LAST_NAME,    RECIPIENT_FIRST_NAME,     RECIPIENT_MIDDLE_NAME,     EXT_ID,     OPERATION_DATE)
+        select trn.RECIPIENT_LAST_NAME,    trn.RECIPIENT_FIRST_NAME, trn.RECIPIENT_MIDDLE_NAME, trn.EXT_ID, trn.CREATE_DATE
         from foreign_tables.incoming_transfer as trn
         where trn.part=n;
     end loop;
-
 
     select Max(id) into id_max from t;
 
@@ -56,25 +55,24 @@ do $$
          step := step + 1;
          id_stop:=id_start+rowsStep;
          if(id_stop>id_max) then id_stop:=id_max; end if;
-
-        UPDATE sbp_b2c_history.history_operation ho
-        SET RECIPIENT_PHONE_NUMBER = t.RECIPIENT_PHONE_NUMBER,
-            STATUS_VALUE = t.STATUS_VALUE,
-            SENDER_INN = t.SENDER_INN,
-            SENDER_ACCOUNT = t.SENDER_ACCOUNT,
-            VERIFICATION_DATE = t.VERIFICATION_DATE,
-            CUSTOM_PRODUCT_TYPE = t.CUSTOM_PRODUCT_TYPE,
-            RECIPIENT_EPK_ID = t.RECIPIENT_EPK_ID,
-            SENDER_BANK_ID = t.SENDER_BANK_ID,
-            SENDER_BIC = t.SENDER_BIC
-
-        FROM t
-        WHERE t.id>=id_start and t.id<=id_stop and t.EXT_ID = ho.EXT_ID and t.OPERATION_DATE=ho.OPERATION_DATE;
-
-        GET DIAGNOSTICS rowsAfect = ROW_COUNT;
+          
+		n := 0; 
+		for       extid,    odate,          vRECIPIENT_LAST_NAME, vRECIPIENT_FIRST_NAME, vRECIPIENT_MIDDLE_NAME 
+		 in select ext_id,  operation_date, t.RECIPIENT_LAST_NAME, t.RECIPIENT_FIRST_NAME, t.RECIPIENT_MIDDLE_NAME
+		      from t 
+			 where t.id>=id_start and t.id<=id_stop loop
+			 
+        	UPDATE sbp_b2c_history.history_operation ho
+	        SET 	RECIPIENT_LAST_NAME = t.RECIPIENT_LAST_NAME,
+    	        	RECIPIENT_FIRST_NAME = t.RECIPIENT_FIRST_NAME,
+        	    	RECIPIENT_MIDDLE_NAME = t.RECIPIENT_MIDDLE_NAME
+        	WHERE extid = ho.EXT_ID and odate=ho.OPERATION_DATE;
+			n:=n+1;
+		end loop;
+		
         COMMIT;
 
-        raise notice 'step % id_start % id_stop % rowsAfect % time %',step, id_start,id_stop,rowsAfect,localtime;
+        raise notice 'step % id_start % id_stop % rowsAfect % time %',step, id_start,id_stop,n,localtime;
         id_start:=id_stop;
         rowsAfectAll:=rowsAfectAll+rowsAfect;
     end loop;
