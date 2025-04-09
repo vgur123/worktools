@@ -63,9 +63,9 @@ do $$
 			 where t.id>=id_start and t.id<=id_stop loop
 			 
         	UPDATE sbp_b2c_history.history_operation ho
-	        SET 	RECIPIENT_LAST_NAME = t.RECIPIENT_LAST_NAME,
-    	        	RECIPIENT_FIRST_NAME = t.RECIPIENT_FIRST_NAME,
-        	    	RECIPIENT_MIDDLE_NAME = t.RECIPIENT_MIDDLE_NAME
+	        SET 	RECIPIENT_LAST_NAME = vRECIPIENT_LAST_NAME,
+    	        	RECIPIENT_FIRST_NAME = vRECIPIENT_FIRST_NAME,
+        	    	RECIPIENT_MIDDLE_NAME = vRECIPIENT_MIDDLE_NAME
         	WHERE extid = ho.EXT_ID and odate=ho.OPERATION_DATE;
 			n:=n+1;
 		end loop;
