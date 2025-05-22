@@ -1,12 +1,12 @@
+--ALTER TABLE sbp_transfer ADD CONSTRAINT unique_suit UNIQUE (suit);
+
 do $$
     declare
-        date_start date := '2025-03-01';
-	    date_stop date := '2025-03-30';
+        date_start date := '2024-01-01';
+	    date_stop date := '2024-01-30';
 
-        datePartBegin date:='2000-01-01'; --Don't change!!!
-
-        maxStep     integer := 3000; 
-        rowsStep    integer := 14; 
+        maxStep     integer := 3000; --Max number of steps
+        rowsStep    integer := 1000; --Rows per step
 
         id_start    bigint;
         id_stop     bigint;
@@ -15,68 +15,67 @@ do $$
         rowsAfect   bigint;
         rowsAfectAll bigint:=0;
 
-        part_start  bigint;
-        part_stop   bigint;
-		
-		rec RECORD;
-	    n     				int8;
+		rec         RECORD;
+	    n     		int8;
 
-begin
+    begin
+		--SET search_path = transfers_global_search_spb, "$user", public;
 
-        DROP TABLE IF EXISTS t;
-        CREATE TEMPORARY TABLE t(
-            id 				    bigserial    not null PRIMARY KEY,
-            OPERATION_DATE		DATE NOT NULL,
-            EXT_ID			    VARCHAR(32) NOT NULL,
-            RECIPIENT_LAST_NAME	    VARCHAR(100),
-            RECIPIENT_FIRST_NAME	VARCHAR(100),
-            RECIPIENT_MIDDLE_NAME	VARCHAR(100)
+        DROP TABLE IF EXISTS tmp_table;
+        CREATE TEMPORARY TABLE tmp_table(
+               ID               bigint not null,
+               OPERATION_DATE	DATE NOT NULL,
+               EXT_ID		    VARCHAR(32) NOT NULL,
+               PART             bigint,
+               SUIT             VARCHAR(32),
+               PRIMARY KEY (ID)
         );
 
-        part_start:=DATE_PART('Day', date_start::timestamp-datePartBegin::timestamp);
-        part_stop:=DATE_PART('Day', date_stop::timestamp-datePartBegin::timestamp);
 
-        for n in part_start..part_stop loop
-            insert into t (RECIPIENT_LAST_NAME,    RECIPIENT_FIRST_NAME,     RECIPIENT_MIDDLE_NAME,     EXT_ID,     OPERATION_DATE)
-            select trn.RECIPIENT_LAST_NAME,    trn.RECIPIENT_FIRST_NAME, trn.RECIPIENT_MIDDLE_NAME, trn.EXT_ID, trn.CREATE_DATE
-            from sbp_b2c.incoming_transfer as trn
-            where trn.part=n;
-        end loop;
+        create index idx_suit on tmp_table (suit);
 
-        select Max(id) into id_max from t;
+        
+        insert into tmp_table (ID, OPERATION_DATE, EXT_ID, PART, SUIT)
+        select row_number() OVER (order by OPERATION_DATE,EXT_ID) as ID,OPERATION_DATE, EXT_ID, CAST (to_char(OPERATION_DATE, 'YYYYMMDD') AS INTEGER), SUIT        from sbp_b2c_history.history_operation
+        where OPERATION_DATE>=date_start and OPERATION_DATE<=date_stop
+        order by OPERATION_DATE,EXT_ID;
+
+        
+        DELETE FROM tmp_table t1 USING sbp_transfer t2 WHERE  t2.suit = t1.suit;
+        select Max(ID) into id_max from tmp_table;
 
         id_start=1;
         raise notice 'start maxStep: % rowsStep: % id_start: % id_max: % time: %',maxStep,rowsStep, id_start,id_max,localtime;
 
-    while step < maxStep and id_start<id_max loop
-         step := step + 1;
-         id_stop:=id_start+rowsStep;
-         if(id_stop>id_max) then id_stop:=id_max; end if;
+    --Основной цикл
+    while step < maxStep and id_start <= id_max loop
+        step := step + 1;
+        id_stop:=id_start+rowsStep;
+        if(id_stop>id_max) then id_stop:=id_max; end if;
 
-		n := 0;
-        for rec in select t.EXT_ID, t.OPERATION_DATE, t.RECIPIENT_LAST_NAME, t.RECIPIENT_FIRST_NAME, t.RECIPIENT_MIDDLE_NAME
-            from t
-            where t.id>=id_start and t.id<=id_stop 
-			
-			loop
-			
-            UPDATE sbp_b2c_history.history_operation ho
-            SET 	RECIPIENT_LAST_NAME = rec.RECIPIENT_LAST_NAME,
-                    RECIPIENT_FIRST_NAME = rec.RECIPIENT_FIRST_NAME,
-                    RECIPIENT_MIDDLE_NAME = rec.RECIPIENT_MIDDLE_NAME
-            WHERE ho.EXT_ID = rec.EXT_ID and ho.OPERATION_DATE = rec.OPERATION_DATE;
-			
-            n:=n+1;
-        	end loop;
-
+        n := 0;
        
-		COMMIT;
-        raise notice 'step % id_start % id_stop % rowsAfect % time %',step, id_start, id_stop, n, localtime;
+        for rec in select OPERATION_DATE, EXT_ID, PART
+         from tmp_table
+         where tmp_table.ID>=id_start and tmp_table.ID<id_stop
+         loop
+            insert into sbp_transfer (partition, suit, custom_product,      epk_id,                             transfer_version, create_date,    status,       transfer_sum, transfer_currency, card_num,         receiver_phone_number,  doc_id, nspk_id, receiver_first_name,  receiver_last_name,  receiver_middle_name)
+            select                    rec.PART, SUIT,  upper(CUSTOM_PRODUCT_TYPE), CAST ((RECIPIENT_EPK_ID) AS BIGINT), 1,                OPERATION_DATE, STATUS_VALUE, PAYMENT_SUMMA, CURRENCY,         PAY_TOOL_NUMBER,  RECIPIENT_PHONE_NUMBER, DOC_ID, EXT_ID,  upper(RECIPIENT_FIRST_NAME), upper(RECIPIENT_LAST_NAME), upper(RECIPIENT_MIDDLE_NAME)
+            from sbp_b2c_history.history_operation as hst
+            where hst.OPERATION_DATE=rec.OPERATION_DATE and hst.EXT_ID=rec.EXT_ID;
+
+            n:=n+1;
+        end loop;
+
+        COMMIT;
+
+        raise notice 'step % id_start % id_stop % rowsAfect % time %',step, id_start,id_stop,n,localtime;
         id_start:=id_stop;
         rowsAfectAll:=rowsAfectAll+n;
 
     end loop;
 
-    raise notice 'finish step: % id_stop: % id_max: % rowsAfectAll: % time: %',step, id_stop, id_max, rowsAfectAll, localtime ;
+    raise notice 'finish step: % id_stop: % id_max: % rowsAfectAll: % time: %',step, id_stop,id_max,rowsAfectAll,localtime ;
 
 end$$;
+
