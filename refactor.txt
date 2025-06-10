@@ -1,0 +1,229 @@
+Your PL/pgSQL block is generally well-structured and uses a batch-processing loop to move data from sbp_b2c_history.history_operation to sbp_transfer, based on some conditions and a sliding window mechanism (id_start to id_stop). Here's a breakdown with some comments, validations, and suggestions to improve it:
+
+✅ What It Does Well:
+Batch Insert Logic: The script processes data in chunks (rowsStep = 1000) to avoid memory/transaction bloat.
+
+Temporary Table Usage: tmp_table acts as a staging layer to help with filtering and batch iteration.
+
+De-duplication Logic: The DELETE FROM tmp_table ... USING sbp_transfer step prevents already transferred records from being re-processed.
+
+Debugging Aids: RAISE NOTICE statements are included for tracking progress.
+
+⚠️ Issues and Suggestions:
+1. No Explicit BEGIN for the Insert Transaction
+While COMMIT is used, you haven't explicitly opened a transaction. Inside a DO $$ block, PostgreSQL runs in an anonymous transaction. That’s okay for this case, but you can't ROLLBACK partially if something fails in the loop.
+
+➡ Suggestion:
+For large operations or production, consider using explicit BEGIN; ... COMMIT; inside a function, or split this into multiple stored procedures.
+
+2. Potential for Skipping the Final Record
+The if(id_start=id_max) condition may cause the final record not to be processed in the loop if id_max isn't divisible evenly by rowsStep.
+
+➡ However, you already handled the last record manually:
+
+sql
+Copy
+Edit
+select OPERATION_DATE, EXT_ID, PART into last_rec ...
+insert into sbp_transfer ...
+So this is mostly safe.
+
+✅ But it could be inefficient if the last record is already processed in the main loop.
+
+➡ Suggestion:
+Add a check:
+
+plpgsql
+Copy
+Edit
+if last_rec.OPERATION_DATE is not null then
+    -- Insert only if it doesn't already exist
+end if;
+3. Hardcoded Field Mappings
+sql
+Copy
+Edit
+select ... upper(CUSTOM_PRODUCT_TYPE), CAST ((RECIPIENT_EPK_ID) AS BIGINT), ...
+These values come from the history_operation table, but you're assuming that all combinations of OPERATION_DATE and EXT_ID are unique. If not, this might insert multiple rows per iteration.
+
+➡ Suggestion: Consider using LIMIT 1 if only one row per EXT_ID is expected:
+
+sql
+Copy
+Edit
+... from sbp_b2c_history.history_operation
+where OPERATION_DATE=rec.OPERATION_DATE and EXT_ID=rec.EXT_ID
+LIMIT 1;
+4. No Error Handling
+You don’t have exception blocks (EXCEPTION WHEN OTHERS THEN ...). A single failure in insert into sbp_transfer will break the entire execution.
+
+➡ Suggestion:
+Add exception handling per iteration if partial processing is acceptable:
+
+plpgsql
+Copy
+Edit
+begin
+   -- insert logic
+exception
+   when others then
+      raise notice 'Insert failed for % %: %', rec.OPERATION_DATE, rec.EXT_ID, SQLERRM;
+end;
+5. Indexing on tmp_table
+You're creating an index:
+
+sql
+Copy
+Edit
+create index idx_suit on tmp_table (suit);
+But you never query tmp_table by suit. The only relevant filter on suit is in the DELETE ... USING join.
+
+➡ Suggestion: Consider dropping this index if not needed, or replacing it with an index on (operation_date, ext_id) which is used more.
+
+✅ Final Thought
+Your script is close to production quality and demonstrates good understanding of PostgreSQL batch processing. With some minor tweaks for:
+
+Error resilience
+
+Performance optimization
+
+Avoiding edge case duplication
+
+...you can make it much more robust.
+
+
+
+
+----------------------------
+
+
+To optimize your current PL/pgSQL script, you can focus on improving performance, resource usage, and robustness. Here's a structured optimization plan tailored to your case:
+
+✅ 1. Eliminate Unnecessary Indexes
+You're creating:
+
+sql
+Copy
+Edit
+CREATE INDEX idx_suit ON tmp_table (suit);
+But you never query tmp_table using suit, only in a DELETE ... USING join, which is not guaranteed to use that index.
+
+🔧 Replace with composite index:
+sql
+Copy
+Edit
+CREATE INDEX idx_tmp_op_ext ON tmp_table (operation_date, ext_id);
+This supports your frequent filter:
+
+sql
+Copy
+Edit
+WHERE tmp_table.ID BETWEEN id_start AND id_stop
+AND JOIN on OPERATION_DATE and EXT_ID.
+✅ 2. Improve De-Duplication (DELETE) Step
+Current:
+
+sql
+Copy
+Edit
+DELETE FROM tmp_table t1 USING sbp_transfer t2 WHERE t2.suit = t1.suit;
+This may remove too many rows if suit is not unique.
+
+🛠 Suggested:
+If sbp_transfer and tmp_table both uniquely identify by (operation_date, ext_id), use:
+
+sql
+Copy
+Edit
+DELETE FROM tmp_table t
+USING sbp_transfer s
+WHERE s.nspk_id = t.ext_id
+AND s.create_date = t.operation_date;
+✅ 3. Avoid Redundant Inserts (If Already Exists in Target)
+In the insert loop:
+
+sql
+Copy
+Edit
+INSERT INTO sbp_transfer ...
+SELECT ...
+FROM sbp_b2c_history.history_operation ...
+WHERE OPERATION_DATE = rec.OPERATION_DATE AND EXT_ID = rec.EXT_ID;
+If you're not deduplicating carefully, you might insert duplicates.
+
+🛡 Add WHERE NOT EXISTS condition:
+sql
+Copy
+Edit
+... 
+WHERE OPERATION_DATE = rec.OPERATION_DATE AND EXT_ID = rec.EXT_ID
+AND NOT EXISTS (
+    SELECT 1 FROM sbp_transfer s
+    WHERE s.nspk_id = rec.EXT_ID AND s.create_date = rec.OPERATION_DATE
+)
+✅ 4. Bulk Insert Instead of Row-by-Row Loop
+The loop currently inserts one record per iteration, which is inefficient in PostgreSQL.
+
+🔁 Replace loop with a bulk INSERT per batch:
+sql
+Copy
+Edit
+INSERT INTO sbp_transfer (...)
+SELECT
+    tmp.part, hst.suit, upper(hst.custom_product_type), CAST(hst.recipient_epk_id AS BIGINT), 1,
+    hst.operation_date, hst.status_value, hst.payment_summa, hst.currency,
+    hst.pay_tool_number, hst.recipient_phone_number, hst.doc_id, hst.ext_id,
+    upper(hst.recipient_first_name), upper(hst.recipient_last_name), upper(hst.recipient_middle_name)
+FROM tmp_table tmp
+JOIN sbp_b2c_history.history_operation hst
+    ON hst.operation_date = tmp.operation_date AND hst.ext_id = tmp.ext_id
+WHERE tmp.id BETWEEN id_start AND id_stop;
+This eliminates the inner FOR LOOP completely and leverages PostgreSQL's set-based operations, which are much faster.
+
+✅ 5. Parallelize or Partition by Date
+If you're dealing with large volumes (millions+), you could:
+
+Run this code per day, or
+
+Add parallel workers using a job queue (e.g., pg_cron, background workers, or external scheduler like Airflow).
+
+✅ 6. Transactional Control + Exception Handling
+Your code runs in an implicit transaction, but lacks control over failures.
+
+🔁 Wrap bulk insert in a sub-block:
+plpgsql
+Copy
+Edit
+BEGIN
+    -- Insert block
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Insert failed: %', SQLERRM;
+        -- optionally log to an error table
+END;
+✅ 7. Use EXPLAIN ANALYZE to Profile Performance
+To get actual query timings, run:
+
+sql
+Copy
+Edit
+EXPLAIN ANALYZE
+INSERT INTO sbp_transfer ...
+You'll see where time is spent — whether on joins, sorts, index scans, etc.
+
+🧠 Summary of Optimization Steps
+Area	Optimization
+Indexes	Add composite index on (operation_date, ext_id)
+DELETE condition	Use precise match using (ext_id, operation_date)
+Insert method	Replace row loop with set-based INSERT ... SELECT
+Duplicate check	Add WHERE NOT EXISTS to prevent redundant inserts
+Transaction scope	Add error handling inside inserts
+Query profiling	Use EXPLAIN ANALYZE to tune specific statements
+Scheduling	Optional: Parallelize or split per day (e.g., cron jobs)
+
+A network error occurred. Please check your connection and try again. If this issue persists please contact us through our help center at help.openai.com.
+
+
+Retry
+
+
